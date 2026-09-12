@@ -331,7 +331,7 @@ async function switchMealPeriod(page, period, debug) {
 // Add → open calculator → read → clear dance — this is both a big speed win
 // (dining halls repeat a lot of items across Lunch/Dinner) and the only
 // reason scraping three periods doesn't just take 3x as long.
-async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
+async function scrapeItemsForPeriod(page, period, debug, nutritionCache, deadline) {
   const itemMatch = await findFirstMatch(page, SELECTORS.menuItem);
   if (!itemMatch) {
     console.warn(`[${period}] No menu item elements found.`);
@@ -365,6 +365,17 @@ async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
       continue;
     }
 
+    // Hard time budget: once we're out of runway, stop trying to click into
+    // items for nutrition detail and just record the remaining names. They
+    // still show up and are searchable — they just route to Quick Add
+    // instead of auto-filled nutrition, same fallback as any item nutrition
+    // parsing fails for. This is what actually guarantees the whole sync
+    // finishes in a bounded time instead of scaling with menu size.
+    if (Date.now() > deadline) {
+      items.push({ name, mealPeriod: period, ...emptyNutrition() });
+      continue;
+    }
+
     let nutrition = emptyNutrition();
 
     try {
@@ -392,17 +403,39 @@ async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
       );
 
       if (addClicked) {
-        // Trimmed from the original 500ms — still enough for the calculator
-        // state to update, just less dead time per item.
-        await new Promise((r) => setTimeout(r, 350));
+        // Poll for the calculator to register the add, instead of always
+        // waiting a fixed amount — most items update almost instantly.
+        await page
+          .waitForFunction(
+            () => {
+              const regex = /^\d+\s*items?\s*\d*\s*cal/i;
+              const all = document.querySelectorAll("body *");
+              for (const el of all) {
+                if (el.children.length === 0 && el.textContent && regex.test(el.textContent.trim())) {
+                  if (!/^0\s*items?\s*0?\s*cal/i.test(el.textContent.trim())) return true;
+                }
+              }
+              return false;
+            },
+            { timeout: 1200, polling: 100 }
+          )
+          .catch(() => {});
 
         const pillClicked = await clickCalculatorPill(page);
         if (pillClicked) {
-          await new Promise((r) => setTimeout(r, 350));
-          let bodyText = await page.evaluate(() => document.body.innerText);
+          let bodyText = await page
+            .waitForFunction(() => document.body.innerText.includes("Summary Nutritional Information"), {
+              timeout: 1500,
+              polling: 100,
+            })
+            .then(() => page.evaluate(() => document.body.innerText))
+            .catch(() => page.evaluate(() => document.body.innerText));
+
           let markerIdx = bodyText.indexOf("Summary Nutritional Information");
+
+          // One retry with a bit more patience — worth affording now that
+          // the budget is realistic instead of a race against 20 seconds.
           if (markerIdx === -1) {
-            // Retry window trimmed from 900ms to 600ms.
             await new Promise((r) => setTimeout(r, 600));
             bodyText = await page.evaluate(() => document.body.innerText);
             markerIdx = bodyText.indexOf("Summary Nutritional Information");
@@ -416,10 +449,8 @@ async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
           }
 
           await clickButtonByText(page, "Clear all");
-          await new Promise((r) => setTimeout(r, 200));
           const okClicked = await clickButtonByText(page, "Ok");
           if (!okClicked) await closeAnyDialog(page);
-          await new Promise((r) => setTimeout(r, 200));
         } else if (debug) {
           console.warn(`  [debug] "${name}": Added, but couldn't find the calculator summary pill to click.`);
         }
@@ -440,6 +471,16 @@ async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
 }
 
 async function scrapeMenu({ debug = false } = {}) {
+  const scrapeStart = Date.now();
+  // A full day (breakfast + lunch + dinner) genuinely takes longer than a
+  // single period, since every item needs its own click-and-read — there's
+  // no way around that given how the site exposes nutrition. This deadline
+  // exists purely as a safety ceiling against something going genuinely
+  // wrong (a hung page, a selector that stopped matching), not as a target
+  // to race — sync runs in the background now, so taking a couple minutes
+  // doesn't block or error the page the way it used to.
+  const deadline = scrapeStart + 150000;
+
   const browser = await puppeteer.launch({
     headless: !debug,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || findLocalChrome() || undefined,
@@ -459,9 +500,18 @@ async function scrapeMenu({ debug = false } = {}) {
     );
 
     console.log(`Navigating to ${MENU_URL} ...`);
-    await page.goto(MENU_URL, { waitUntil: "networkidle2", timeout: 60000 });
-    // Trimmed from 3000ms — networkidle2 already means requests have quieted.
-    await new Promise((r) => setTimeout(r, 2000));
+    await page.goto(MENU_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await new Promise((r) => setTimeout(r, 800));
+
+    await page
+      .waitForFunction(
+        () => {
+          const candidates = document.querySelectorAll('[class*="menu-item"], [class*="MenuItem"], button[class*="item"]');
+          return candidates.length > 3;
+        },
+        { timeout: 8000, polling: 300 }
+      )
+      .catch(() => {});
 
     if (debug) {
       const html = await page.content();
@@ -484,16 +534,15 @@ async function scrapeMenu({ debug = false } = {}) {
     const stations = [];
 
     for (const period of MEAL_PERIODS) {
-      console.log(`\n--- ${period} ---`);
+      console.log(`\n--- ${period} (${((Date.now() - scrapeStart) / 1000).toFixed(1)}s elapsed) ---`);
       const switched = await switchMealPeriod(page, period, debug);
       if (!switched) {
         console.warn(
           `[${period}] Couldn't confirm the meal-period switch worked — scraping whatever's ` +
-            `currently on screen and tagging it as "${period}" anyway. If this happens for every ` +
-            `period, run with --debug and check the [debug] lines above for what's not matching.`
+            `currently on screen and tagging it as "${period}" anyway.`
         );
       }
-      const items = await scrapeItemsForPeriod(page, period, debug, nutritionCache);
+      const items = await scrapeItemsForPeriod(page, period, debug, nutritionCache, deadline);
       const withNutrition = items.filter((it) => it.calories != null).length;
       console.log(`[${period}] Captured nutrition for ${withNutrition} / ${items.length} items.`);
       stations.push({ name: period, items });
@@ -504,7 +553,9 @@ async function scrapeMenu({ debug = false } = {}) {
       (n, s) => n + s.items.filter((it) => it.calories != null).length,
       0
     );
-    console.log(`\nDone. ${totalWithNutrition} / ${totalItems} items across all three meal periods have nutrition data.`);
+    console.log(
+      `\nDone in ${((Date.now() - scrapeStart) / 1000).toFixed(1)}s. ${totalWithNutrition} / ${totalItems} items across all three meal periods have nutrition data.`
+    );
     console.log(`(${nutritionCache.size} distinct dishes were fetched; repeats across periods were reused from cache.)`);
 
     return { scrapedAt: new Date().toISOString(), stations };
