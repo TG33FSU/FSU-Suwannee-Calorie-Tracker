@@ -37,6 +37,7 @@ const DIARY_FILE = path.join(DATA_DIR, "diary.json");
 const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 const CUSTOM_FOODS_FILE = path.join(DATA_DIR, "custom-foods.json");
 const RATINGS_FILE = path.join(DATA_DIR, "ratings.json");
+const MENU_HISTORY_DIR = path.join(DATA_DIR, "menu-history");
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -72,6 +73,15 @@ const fileBackend = {
   },
   async saveMenuCache(menu) {
     writeJson(MENU_FILE, menu);
+  },
+  // Per-date menu history — saved alongside the "latest" cache above so
+  // previous days' menus aren't lost when a new scrape comes in.
+  async saveMenuForDate(date, menu) {
+    if (!fs.existsSync(MENU_HISTORY_DIR)) fs.mkdirSync(MENU_HISTORY_DIR, { recursive: true });
+    writeJson(path.join(MENU_HISTORY_DIR, `${date}.json`), menu);
+  },
+  async getMenuForDate(date) {
+    return readJson(path.join(MENU_HISTORY_DIR, `${date}.json`), null);
   },
   async getCustomFoods() {
     return readJson(CUSTOM_FOODS_FILE, []);
@@ -139,6 +149,19 @@ const mongoBackend = {
   async saveMenuCache(menu) {
     const db = await getMongoDb();
     await db.collection("menu_cache").replaceOne({ _id: "singleton" }, { _id: "singleton", ...menu }, { upsert: true });
+  },
+  // Per-date menu history — a separate collection keyed by date string
+  // (e.g. "2026-09-12"), so overwriting "latest" never destroys older
+  // days' data. Matches the FSU → Suwannee Room → date → meal-periods shape
+  // conceptually, scoped to this app's single dining hall for now.
+  async saveMenuForDate(date, menu) {
+    const db = await getMongoDb();
+    await db.collection("menu_history").replaceOne({ _id: date }, { _id: date, ...menu }, { upsert: true });
+  },
+  async getMenuForDate(date) {
+    const db = await getMongoDb();
+    const doc = await db.collection("menu_history").findOne({ _id: date });
+    return doc ? { ...doc, _id: undefined } : null;
   },
   async getCustomFoods() {
     const db = await getMongoDb();
@@ -209,6 +232,12 @@ async function getMenuCache() {
 async function saveMenuCache(menu) {
   return backend.saveMenuCache(menu);
 }
+async function saveMenuForDate(date, menu) {
+  return backend.saveMenuForDate(date, menu);
+}
+async function getMenuForDate(date) {
+  return backend.getMenuForDate(date);
+}
 
 async function getCustomFoods() {
   return backend.getCustomFoods();
@@ -274,6 +303,8 @@ async function saveDayEntry(date, dayData) {
 module.exports = {
   getMenuCache,
   saveMenuCache,
+  saveMenuForDate,
+  getMenuForDate,
   getCustomFoods,
   saveCustomFoods,
   getRatings,
